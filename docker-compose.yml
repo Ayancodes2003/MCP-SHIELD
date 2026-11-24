@@ -1,0 +1,28 @@
+# Full-mode reference deployment: gateway + OPA sidecar. Postgres/Redis/Keycloak/OTel arrive in later releases.
+# Put your gateway.yaml, agents.yaml and tool_labels.yaml in ./deploy/config (see docs/deployment.md).
+services:
+  opa:
+    image: openpolicyagent/opa:1.22.4-static
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=error", "/policies"]
+    volumes:
+      - ./policies:/policies:ro
+    read_only: true
+    user: "10001"
+
+  gateway:
+    build: .
+    depends_on: [opa]
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./deploy/config:/app/config:ro
+      - shield-data:/app/data
+    environment:
+      MCP_SHIELD_DATABASE_URL: sqlite:////app/data/mcp_shield.db
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  shield-data:

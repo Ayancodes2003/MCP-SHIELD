@@ -1,0 +1,198 @@
+PROJECT BRIEF: MCP Security Gateway (“mcp-shield”)
+0. How you (the coding agent) should work
+Build this autonomously. Make reasonable decisions yourself and record each non-obvious one in docs/adr/NNN-title.md (short: context, decision, alternatives rejected). Don’t stop to ask questions unless you are truly blocked.
+Work milestone by milestone (Section 14). Don’t start a milestone until the previous one’s acceptance criteria pass.
+After each milestone: run the tests, run the linter, commit with a clear message, and update README.md and docs/PROGRESS.md.
+Never fabricate benchmark numbers. All metrics in the README must come from make eval output committed under evals/results/.
+Everything must run locally with docker compose up and no paid services. Any LLM-dependent component must have a provider-agnostic interface, a mock implementation for tests, and a config switch.
+1. What this is
+
+A security proxy that sits between AI agents (MCP clients) and one or more upstream MCP servers. It enforces authentication, per-agent/per-tool/per-argument authorization, detects prompt injection, tool poisoning, and rug-pull attacks, tracks data-flow taint across a session to stop exfiltration, requires human approval for high-risk calls, and writes a tamper-evident audit log. It ships with a reproducible evaluation harness that measures attack block rate, false-positive rate, latency overhead, and task utility with and without the gateway.
+
+Why it exists: Companies are connecting agents to many MCP servers with no central control over tool poisoning, injection through tool outputs, over-permissioned access, or auditability.
+
+Non-goals: building a general LLM firewall for chat prompts, training a foundation model, or a production-grade multi-region deployment.
+
+2. Tech stack (fixed unless an ADR justifies a change)
+Python 3.12, managed with uv; pyproject.toml; ruff + mypy --strict on the core package; pytest, pytest-asyncio, hypothesis
+Gateway: FastAPI/Starlette + uvicorn, httpx (async) for upstream calls, Pydantic v2
+MCP: the official mcp Python SDK for building the mock/demo servers and test clients. The gateway handles raw JSON-RPC 2.0 over Streamable HTTP itself so it can inspect and modify messages, and also supports proxying stdio upstream servers by spawning them.
+Policy engine: Open Policy Agent run as a sidecar container, queried via its REST API; policies in Rego under policies/, tested with opa test
+Storage: Postgres 16 (audit log, approvals, tool registry, LangGraph checkpoints), Redis 7 (rate limiting, session state, caches)
+Detection: Tier 1 regex/heuristics, Tier 2 a small transformer classifier (HuggingFace transformers, exported to ONNX Runtime for CPU inference; default model: protectai/deberta-v3-base-prompt-injection-v2, configurable), Tier 3 an LLM judge behind an interface (providers: Anthropic API, OpenAI-compatible endpoint incl. local Ollama, and a deterministic mock)
+Approval workflow: LangGraph with interrupt and the Postgres checkpointer
+Observability: OpenTelemetry (traces + metrics) → OTel Collector → Jaeger + Prometheus + Grafana; Langfuse optional for the LLM judge traces
+Dashboard/admin UI: server-rendered Jinja2 + HTMX served by the gateway (no separate SPA)
+Auth: OIDC via a Keycloak container in the dev compose; JWT validation with JWKS caching
+CI: GitHub Actions (lint, type-check, unit tests, OPA tests, a fast eval subset)
+3. Repository layout
+mcp-shield/
+├── pyproject.toml, Makefile, docker-compose.yml, README.md
+├── docs/ (architecture.md, threat-model.md, adr/, PROGRESS.md, policy-guide.md)
+├── src/mcp_shield/
+│   ├── main.py                # app factory
+│   ├── config.py              # pydantic-settings, YAML + env
+│   ├── proxy/                 # jsonrpc.py, transport_http.py, transport_stdio.py, session.py, router.py
+│   ├── auth/                  # oidc.py, tokens.py, identity.py
+│   ├── registry/              # tool_registry.py (pinning, diffing, rug-pull), models.py
+│   ├── policy/                # opa_client.py, input_builder.py, decision.py
+│   ├── detection/             # pipeline.py, tier1_rules.py, tier2_classifier.py, tier3_judge.py, schemas.py, providers/
+│   ├── taint/                 # labels.py, tracker.py, provenance.py
+│   ├── approvals/             # graph.py (LangGraph), service.py, models.py
+│   ├── audit/                 # chain.py, writer.py, verify.py
+│   ├── ratelimit/             # limiter.py
+│   ├── dlp/                   # patterns.py, redact.py
+│   ├── telemetry/             # otel.py, metrics.py
+│   ├── ui/                    # routes.py, templates/, static/
+│   └── cli.py                 # typer CLI: verify-audit, pin-tools, approve, etc.
+├── policies/ (base.rego, tools.rego, taint.rego, *_test.rego)
+├── config/ (gateway.yaml, agents.yaml, servers.yaml, tool_labels.yaml)
+├── mock_servers/ (crm_server, email_server, files_server, web_fetch_server, plus malicious/ variants)
+├── evals/
+│   ├── attacks/ (YAML-defined attack cases)
+│   ├── benign/ (YAML-defined benign task cases)
+│   ├── harness/ (runner.py, agents/scripted.py, agents/llm_agent.py, metrics.py, report.py)
+│   ├── adapters/ (agentdojo.py, injecagent.py)
+│   └── results/ (committed JSON + generated results.md)
+├── training/ (optional fine-tune scripts + data prep for the Tier 2 classifier)
+└── tests/ (unit/, integration/, e2e/)
+4. Request flow
+The agent connects to the gateway at POST /mcp/{server_alias} (Streamable HTTP) with a bearer JWT. The gateway authenticates and maps the token to an AgentIdentity (agent_id, tenant, roles, scopes, allowed servers).
+The gateway opens or resumes a Session (Redis-backed) holding taint state, call history, and counters.
+tools/list: forward to upstream, then run Tier 1/2 detection over every tool name, description, and input schema. Compare against the pinned registry (hash of name+description+schema). Filter out tools the identity may not see. Return the filtered, sanitized list.
+tools/call: run the pipeline, in order:
+a. Validate the tool exists in the pinned registry and its hash is unchanged (else block and alert)
+b. Validate arguments against the tool’s JSON Schema
+c. Rate limit check
+d. DLP scan of arguments
+e. Build the OPA input (identity, tool, args, session taint state, labels) and query the policy → allow | deny | require_approval plus reasons
+f. If require_approval, start the LangGraph approval flow and hold or return a pending state (see Section 9)
+g. Forward to upstream
+h. Scan the response through the detection cascade (output injection), DLP, and size limits; update taint labels from the tool’s declared labels; sanitize, quarantine, or block per policy
+i. Write the audit record; emit traces and metrics
+Notifications (notifications/tools/list_changed): trigger re-fetch and re-diff against pins.
+Resources and prompts (resources/read, prompts/get) pass through the same detection and policy path as tools, with their own policy namespaces.
+
+Fail behavior is configurable per policy: fail-closed by default for tools/call, with a documented fail-open option for read-only tools if the detector times out. Every fail-open or fail-closed decision is logged.
+
+5. Component specs
+5.1 Tool registry and rug-pull defense
+On first sight of a server’s tools, store a ToolPin (server, tool name, SHA-256 of canonical JSON of {description, inputSchema, annotations}, first_seen, approved_by, status: pending|approved|revoked).
+New or changed tools are pending and invisible to agents until approved via the UI or CLI (mcp-shield pin approve). A change to an approved tool triggers a RUG_PULL_SUSPECTED event and auto-quarantines the tool.
+Store a readable diff (description text diff) for the reviewer.
+Detect tool shadowing: flag tool descriptions that reference other servers’ tool names or contain instructions about how other tools should behave.
+5.2 Detection cascade
+
+Interface: Detector.analyze(text, context) -> Finding(score 0-1, label, tier, evidence, latency_ms).
+
+Tier 1 (<2 ms): regex and heuristics for instruction-override phrases, hidden Unicode (zero-width, tag characters, bidi), HTML/markdown comment injection, base64 blobs with instruction text, “do not tell the user” patterns, exfil URL patterns (e.g., markdown images with query-string data), tool-name references inside descriptions. Rules live in YAML for easy extension.
+Tier 2 (<30 ms CPU): transformer classifier over chunks (sliding window for long text). Score thresholds low/high configurable.
+Tier 3: LLM judge invoked only if Tier 2 score is in the ambiguous band [low, high]. Strict JSON output schema, temperature 0, with the untrusted text passed as clearly delimited data. The judge must itself be treated as injectable: never give it tools, and validate its output against the schema.
+The pipeline short-circuits (block immediately on high-confidence Tier 1 hits). It records per-tier latency and per-tier contribution for ablation.
+The combined decision comes from a configurable policy, passed to OPA as detection.max_score, detection.labels, and detection.tiers_fired.
+Cache results by content hash in Redis.
+5.3 Policy engine (OPA/Rego)
+
+Input document includes: identity, server, tool, arguments, detection, session.taint, session.call_count, time. Ship these policies with tests:
+
+Per-agent allowlist of servers and tools (agents.yaml compiled into OPA data)
+Argument constraints (e.g., crm.export limit ≤ 50; email recipients must match allowed domains; file paths confined to allowed roots; no wildcards)
+Taint rule: deny or require approval for any tool labeled egress when the session has both private_data and untrusted_content labels
+Destructive-action rule: tools labeled destructive always require approval
+Detection rule: deny if detection.max_score ≥ block_threshold, require approval if between warn and block
+Policy decisions return structured reasons[] with stable codes (e.g., TAINT_EGRESS_BLOCKED) used in audit logs and metrics.
+5.4 Taint / information-flow tracking
+config/tool_labels.yaml assigns each tool labels: reads_private, reads_untrusted, egress, destructive, read_only.
+Session taint state: set of labels plus a list of provenance records (hashed n-gram shingles, 8-token windows, of sensitive tool outputs).
+On an egress call, compute overlap between argument content and stored shingles; a fuzzy match above a threshold sets data_derived_from_private=true in the OPA input. This catches exfiltration even when the agent reformats the data.
+Taint expires on session end; optional decay config.
+5.5 Approval workflow (LangGraph)
+Graph nodes: assess_risk → build_context (human-readable summary: who, what, args, why flagged, recent calls, diff of taint) → interrupt (await decision) → apply_decision (approve/deny/edit-args) → finalize.
+Checkpointer: Postgres. Approvals survive gateway restarts. Timeout leads to auto-deny.
+Approval surface: UI page /approvals plus REST POST /api/approvals/{id}/decision, plus optional Slack webhook notification (config-gated).
+To the agent, a pending approval is returned as a tool result explaining that approval is required, with a retry-after hint, and the gateway never blocks the connection indefinitely.
+5.6 Audit log
+Append-only Postgres table. Each record: id, ts, tenant, agent_id, session_id, server, tool, decision, reason_codes, detection summary, argument hash plus redacted argument snapshot, prev_hash, hash = sha256(prev_hash || canonical_json(record)).
+DB role for the gateway has INSERT-only on this table.
+mcp-shield audit verify walks the chain and reports the first broken link. Include a test that tampers with a row and asserts detection.
+5.7 DLP and redaction
+
+Regex plus checksum detectors for API keys (AWS, GitHub, Slack, generic high-entropy), credit cards (Luhn), emails, phone numbers, SSNs. Modes: detect, redact, block, configurable per tool/direction. Redaction applies to audit snapshots always.
+
+5.8 Rate limiting
+
+Redis token bucket per (agent, tool) and per (agent, server) with configurable burst and rate. Return a JSON-RPC error with a retry hint.
+
+5.9 Auth
+
+Keycloak realm JSON preloaded in compose with two demo agents and one admin user. The gateway validates JWT signature (JWKS), aud, exp, and extracts roles. Implement the MCP protected-resource metadata endpoint (/.well-known/oauth-protected-resource) so spec-compliant clients can discover the authorization server. Upstream credentials are held by the gateway (never exposed to agents) and injected per server from env/secret files.
+
+6. Mock MCP servers (needed for demo and evals)
+
+Build with the official SDK, each runnable standalone and in compose:
+
+crm_server: search_customers, get_customer, export_customers(limit), delete_customer (labels: reads_private, destructive)
+email_server: read_inbox, send_email(to, subject, body) (reads_untrusted, egress)
+files_server: read_file, write_file, list_dir
+web_fetch_server: fetch_url (reads_untrusted), serving canned pages, some containing injections
+malicious/ variants: a server with a poisoned tool description, a server that swaps a tool description after N calls (rug pull), a server whose tool shadows send_email, a server returning injected output, and one with schema abuse (extra hidden params).
+
+Seed the data with synthetic customers, emails, and files (including a fake “secrets” file) so exfiltration is measurable.
+
+7. Evaluation harness (the credibility piece)
+
+Attack suite (YAML cases, 60+ at minimum), categories: direct injection in tool output, indirect injection via email/web/file, tool poisoning, rug pull, tool shadowing, exfiltration via egress tools and via URL/markdown, confused deputy (privilege escalation across servers), argument smuggling, Unicode/encoding obfuscation, multi-step attacks (read private, then fetch untrusted, then egress), and DoS/rate abuse. Each case defines: setup, the user’s legitimate task, the injected payload, the attacker goal, and a machine-checkable success condition (e.g., “email_server.send_email was executed with a recipient not in allowlist containing a secret string”).
+
+Benign suite (60+ cases): legitimate multi-tool tasks, including ones that look suspicious (e.g., emailing an internal colleague customer data legitimately, tool outputs containing security-related text). Used to measure false positives and utility.
+
+Agent drivers:
+
+scripted: deterministic agent that executes the attacker goal when the payload is delivered (isolates gateway effectiveness, runs in CI, no LLM cost)
+llm_agent: a real tool-calling agent via a configurable LLM provider that may or may not fall for the payload (realistic, run on demand)
+
+Adapters: AgentDojo and InjecAgent, routing their tool calls through the gateway. Document setup in evals/README.md. If a dataset can’t be downloaded in the environment, implement the adapter against the documented format, gate it behind a flag, and note it in PROGRESS.md.
+
+Configurations to compare (ablation): no gateway; Tier 1 only; Tier 1+2; full cascade; full cascade + taint policy; and an “adaptive” set of attacks (paraphrased, obfuscated, split across steps) generated by an attacker script that mutates payloads to try to evade Tier 1/2.
+
+Metrics (metrics.py, output to JSON and results.md): attack success rate (ASR), block rate, false-positive rate on benign cases, task utility (benign completion rate), detection precision/recall/F1 per tier, p50/p95/p99 latency overhead per layer, LLM judge invocation rate and cost, and approval rate. Include a failure analysis section listing attacks that succeeded and why. make eval runs the full scripted suite and regenerates the report; make eval-fast runs a subset for CI.
+
+8. Observability
+A trace per request with spans: auth, registry, schema, rate_limit, dlp, policy, detection (with a child span per tier), approval, upstream, response_scan, audit.
+Metrics: mcp_requests_total{decision,tool}, detections_total{tier,label}, gateway_latency_seconds histogram, judge_calls_total, taint_blocks_total, rug_pulls_total, approvals_pending.
+Provision a Grafana dashboard JSON in the repo (“Blocked attacks”, “Latency by layer”, “Top blocked tools”, “Pending approvals”).
+9. UI pages (Jinja2 + HTMX)
+
+/ overview stats; /events filterable audit stream; /tools registry with pin status and the diff view plus approve/revoke buttons; /approvals pending queue with context and approve/deny/edit; /policies read-only policy and agent matrix view; /sessions/{id} timeline of calls with taint state. Keep the styling minimal and clean, with no frontend build step.
+
+10. Configuration
+
+Single config/gateway.yaml (servers, thresholds, fail modes, provider selection, rate limits) with env overrides. Provide .env.example listing every variable. No secrets in the repo.
+
+11. Testing requirements
+Unit tests for each module (target ≥85% coverage on src/)
+OPA policy tests via opa test policies/
+Property-based tests (hypothesis) for the JSON-RPC parsing and the audit chain
+Integration tests with docker compose services (marked integration)
+E2E test: agent client → gateway → mock servers for one benign flow and one blocked attack
+Latency regression test: the gateway’s overhead without Tier 3 must stay below a configurable budget (default p95 < 60 ms) on the fixture workload
+12. Deliverables for the README
+
+Architecture diagram (Mermaid), a 5-minute quickstart, a threat model table mapping each attack class to the layer that stops it, a results table generated from evals/results/, a “known limitations / attacks we don’t stop” section, and a design-decisions section.
+
+13. Security of the gateway itself
+
+Run containers as non-root, validate all inputs, set request size and timeout limits, don’t log secrets, pin dependency versions with a lock file, and add a docs/threat-model.md that covers attacks against the gateway (e.g., detector evasion, policy bypass via argument encoding, session fixation).
+
+14. Milestones and acceptance criteria
+Skeleton and transparent proxy: repo scaffold, Streamable HTTP proxy that forwards tools/list and tools/call to one mock server, with tests and compose. Accept: an MCP SDK client works through the gateway unchanged.
+Auth, registry, and audit: OIDC JWT auth, tool pinning with approval, rug-pull detection, hash-chained audit log plus verify CLI. Accept: the rug-pull mock server is caught, and the tamper test passes.
+Policy: OPA integration, base policies, argument constraints, rate limiting, DLP. Accept: OPA tests green; the CRM export limit is enforced.
+Detection cascade: Tier 1, Tier 2 (ONNX), Tier 3 judge with mock and real providers, caching, thresholds. Accept: per-tier latency recorded; the injection fixtures are flagged.
+Taint tracking: labels, session state, shingle provenance, the egress policy. Accept: the multi-step exfiltration scenario is blocked while the benign variant passes.
+Approvals: LangGraph flow with Postgres checkpoints, UI and API, timeout. Accept: an approval survives a gateway restart.
+Eval harness: attack and benign suites, scripted driver, metrics and report, ablation configs, then the AgentDojo/InjecAgent adapters, the LLM agent driver, and the adaptive attacker. Accept: make eval produces results.md with all metrics.
+Observability and UI: OTel traces and metrics, Grafana dashboard, admin pages. Accept: a blocked attack is visible in Jaeger, Grafana, and the UI.
+Polish: CI, docs, ADRs, README results, demo script (make demo runs a scripted walkthrough of an attack being blocked), and cleanup.
+15. Definition of done
+
+docker compose up brings up everything; make demo shows a poisoned-tool attack and an exfiltration attempt being stopped; make test and make eval pass; the README contains real measured results, including honest failures; and all ADRs and threat-model docs are written.
